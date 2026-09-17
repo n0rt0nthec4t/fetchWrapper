@@ -1,0 +1,8 @@
+node_modules
+coverage
+.vscode
+
+# Local editor and operating-system files
+.DS_Store
+**/.DS_Store
+*.code-workspace
