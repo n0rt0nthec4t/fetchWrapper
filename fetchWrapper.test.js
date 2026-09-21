@@ -37,7 +37,6 @@ test('passes GET request options without wrapper bookkeeping', async () => {
   assert.equal(receivedOptions.method, 'get');
   assert.equal(receivedOptions.retry, undefined);
   assert.equal(receivedOptions.timeout, undefined);
-  assert.equal(receivedOptions._retryCount, undefined);
   assert.deepEqual(receivedOptions.headers, { Accept: 'application/json' });
 });
 
@@ -104,9 +103,12 @@ test('releases transient HTTP responses and applies exponential retry delays', a
   let attempts = 0;
   let cancellations = 0;
   let delays = [];
+  let requestOptions = Object.freeze({ retry: 3 });
 
-  let response = await fetchWrapper('get', 'https://example.test', { retry: 3 }, undefined, {
-    fetch: async () => {
+  let response = await fetchWrapper('get', 'https://example.test', requestOptions, undefined, {
+    fetch: async (url, options) => {
+      assert.equal(url, 'https://example.test');
+      assert.deepEqual(options, { method: 'get' });
       attempts += 1;
       if (attempts < 3) {
         return {
@@ -131,6 +133,7 @@ test('releases transient HTTP responses and applies exponential retry delays', a
   assert.equal(attempts, 3);
   assert.equal(cancellations, 2);
   assert.deepEqual(delays, [500, 1000]);
+  assert.deepEqual(requestOptions, { retry: 3 });
 });
 
 test('retries transient transport errors and reports the final attempt count', async () => {

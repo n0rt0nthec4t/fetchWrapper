@@ -12,7 +12,7 @@
 // - Preserve HTTP status and response body details on final errors
 // - Allow transport and delay injection for deterministic tests
 //
-// Code version 2026.09.17
+// Code version 2026.09.21
 // Mark Hulskamp
 'use strict';
 
@@ -21,10 +21,43 @@ import { setTimeout as wait } from 'node:timers/promises';
 
 const RETRYABLE_HTTP_STATUS = [408, 429, 500, 502, 503, 504];
 
+/**
+ * Wrapper-specific fetch options.
+ *
+ * Standard fetch options are also accepted and passed through to the underlying fetch implementation.
+ *
+ * @typedef {RequestInit & object} FetchWrapperOptions
+ * @property {number} [retry=1] Maximum number of request attempts, including the initial attempt.
+ * @property {number} [timeout] Per-attempt timeout in milliseconds.
+ */
+
+/**
+ * Injectable dependencies used to make request and retry behaviour deterministic during testing.
+ *
+ * @typedef {object} FetchWrapperDependencies
+ * @property {typeof fetch} [fetch] Fetch implementation. Defaults to `globalThis.fetch`.
+ * @property {function(number): Promise<*>} [delay] Delay function receiving the retry delay in milliseconds.
+ */
+
+/**
+ * Perform a GET or POST request with timeout, cancellation, and retry handling.
+ *
+ * Plain object POST data is JSON encoded automatically. Other supported fetch body types are passed through unchanged.
+ * Retryable HTTP and transport failures use exponential backoff, while caller cancellation and malformed URLs are terminal.
+ *
+ * @param {'get'|'post'} method HTTP method to perform; use `fetchWrapper.GET` or `fetchWrapper.POST`.
+ * @param {string} url Request URL.
+ * @param {FetchWrapperOptions} [options={}] Fetch and wrapper-specific request options.
+ * @param {*} [data] POST request body. Plain objects are JSON encoded; other values are passed directly to fetch.
+ * @param {FetchWrapperDependencies} [dependencies={}] Optional fetch and delay implementations used primarily for testing.
+ * @returns {Promise<Response|undefined>} Fetch response, or undefined when the request arguments fail initial validation.
+ * @throws {TypeError} If the selected fetch or delay implementation is not a function.
+ * @throws {Error} When the request ultimately fails after retry handling, including HTTP failures and invalid URLs.
+ */
 async function fetchWrapper(method, url, options = {}, data, dependencies = {}) {
   // Retain the existing Accfactory contract for unsupported request inputs.
   if (
-    (method !== 'get' && method !== 'post') ||
+    (method !== fetchWrapper.GET && method !== fetchWrapper.POST) ||
     typeof url !== 'string' ||
     url === '' ||
     options === null ||
@@ -33,11 +66,6 @@ async function fetchWrapper(method, url, options = {}, data, dependencies = {}) 
   ) {
     return;
   }
-
-  // retry represents total attempts rather than additional retries.
-  let configuredRetry = Number(options.retry);
-  let retry = Number.isFinite(configuredRetry) === true && configuredRetry > 0 ? Math.max(1, Math.floor(configuredRetry)) : 1;
-  let retryCount = Number.isFinite(Number(options._retryCount)) === true ? Number(options._retryCount) : 0;
 
   // Keep injectable test boundaries separate from options passed to fetch.
   let fetchImplementation = dependencies?.fetch ?? globalThis.fetch;
@@ -49,6 +77,28 @@ async function fetchWrapper(method, url, options = {}, data, dependencies = {}) 
     throw new TypeError('A delay implementation must be a function');
   }
 
+  return fetchRequest(method, url, options, data, fetchImplementation, delayImplementation, 0);
+}
+
+/**
+ * Execute one request attempt and recursively handle eligible retries.
+ *
+ * @param {'get'|'post'} method Validated HTTP method.
+ * @param {string} url Validated request URL.
+ * @param {FetchWrapperOptions} options Caller-provided request options.
+ * @param {*} data POST request body.
+ * @param {typeof fetch} fetchImplementation Fetch implementation selected at the public boundary.
+ * @param {function(number): Promise<*>} delayImplementation Retry delay implementation selected at the public boundary.
+ * @param {number} retryCount Number of request attempts already completed.
+ * @returns {Promise<Response>} Fetch response.
+ * @throws {Error} When the request ultimately fails after retry handling.
+ * @private
+ */
+async function fetchRequest(method, url, options, data, fetchImplementation, delayImplementation, retryCount) {
+  // retry represents total attempts rather than additional retries.
+  let configuredRetry = Number(options.retry);
+  let retry = Number.isFinite(configuredRetry) === true && configuredRetry > 0 ? Math.max(1, Math.floor(configuredRetry)) : 1;
+
   // Remove wrapper-only values from a clone, leaving caller options unchanged.
   let fetchOptions = {
     ...options,
@@ -56,7 +106,6 @@ async function fetchWrapper(method, url, options = {}, data, dependencies = {}) 
   };
   delete fetchOptions.retry;
   delete fetchOptions.timeout;
-  delete fetchOptions._retryCount;
 
   // Apply timeout per attempt while preserving caller-controlled cancellation.
   if (Number.isFinite(Number(options.timeout)) === true && Number(options.timeout) > 0) {
@@ -64,7 +113,7 @@ async function fetchWrapper(method, url, options = {}, data, dependencies = {}) 
     fetchOptions.signal = options.signal === undefined ? timeoutSignal : globalThis.AbortSignal.any([options.signal, timeoutSignal]);
   }
 
-  if (method === 'post' && data !== undefined) {
+  if (method === fetchWrapper.POST && data !== undefined) {
     // Encode only plain objects; native fetch body types pass through unchanged.
     if (typeof data === 'object' && data !== null && data.constructor === Object) {
       fetchOptions.body = JSON.stringify(data);
@@ -83,9 +132,9 @@ async function fetchWrapper(method, url, options = {}, data, dependencies = {}) 
     let response = await fetchImplementation(url, fetchOptions);
 
     if (response?.ok === false) {
-      let retryableStatus = RETRYABLE_HTTP_STATUS.includes(response.status) === true ? true : false;
+      let retryableStatus = RETRYABLE_HTTP_STATUS.includes(response.status) === true;
 
-      if (retry > 1 && retryableStatus === true && options.signal?.aborted !== true) {
+      if (retryCount + 1 < retry && retryableStatus === true && options.signal?.aborted !== true) {
         // Release the body before retrying so fetch can reuse the connection.
         try {
           await response.body?.cancel();
@@ -96,16 +145,14 @@ async function fetchWrapper(method, url, options = {}, data, dependencies = {}) 
         let delay = 500 * Math.pow(2, retryCount);
         await delayImplementation(delay);
 
-        return fetchWrapper(
+        return fetchRequest(
           method,
           url,
-          {
-            ...options,
-            retry: retry - 1,
-            _retryCount: retryCount + 1,
-          },
+          options,
           data,
-          dependencies,
+          fetchImplementation,
+          delayImplementation,
+          retryCount + 1,
         );
       }
 
@@ -149,9 +196,7 @@ async function fetchWrapper(method, url, options = {}, data, dependencies = {}) 
       original?.name === 'TimeoutError' ||
       original?.name === 'TypeError' ||
       original?.code === 'UND_ERR_HEADERS_TIMEOUT' ||
-      original?.code === 'UND_ERR_CONNECT_TIMEOUT'
-        ? true
-        : false;
+      original?.code === 'UND_ERR_CONNECT_TIMEOUT';
 
     // Native fetch reports malformed URLs as a TypeError with this root code.
     if (original?.code === 'ERR_INVALID_URL') {
@@ -162,20 +207,18 @@ async function fetchWrapper(method, url, options = {}, data, dependencies = {}) 
     }
 
     // Explicit caller cancellation is terminal; transport timeouts remain retryable.
-    if (retry > 1 && retryable === true && options.signal?.aborted !== true) {
+    if (retryCount + 1 < retry && retryable === true && options.signal?.aborted !== true) {
       let delay = 500 * Math.pow(2, retryCount);
       await delayImplementation(delay);
 
-      return fetchWrapper(
+      return fetchRequest(
         method,
         url,
-        {
-          ...options,
-          retry: retry - 1,
-          _retryCount: retryCount + 1,
-        },
+        options,
         data,
-        dependencies,
+        fetchImplementation,
+        delayImplementation,
+        retryCount + 1,
       );
     }
 
@@ -201,4 +244,9 @@ async function fetchWrapper(method, url, options = {}, data, dependencies = {}) 
   }
 }
 
+// Supported HTTP request methods exposed on the wrapper for callers.
+fetchWrapper.GET = 'get';
+fetchWrapper.POST = 'post';
+
+// Export the fetch wrapper for use in other modules.
 export { fetchWrapper };

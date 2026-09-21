@@ -55,12 +55,14 @@ import { fetchWrapper } from '../fetchWrapper.js';
 ## API
 
 ```js
-await fetchWrapper(method, url, options, data);
+await fetchWrapper(fetchWrapper.GET, url, options);
+await fetchWrapper(fetchWrapper.POST, url, options, data);
 ```
 
 ### `method`
 
-Supported values are lowercase `get` and `post`. Unsupported methods return `undefined` without issuing a request.
+Use `fetchWrapper.GET` for GET requests and `fetchWrapper.POST` for POST requests. These constants expose the supported lowercase
+`get` and `post` values. Unsupported methods return `undefined` without issuing a request.
 
 ### `url`
 
@@ -103,7 +105,7 @@ Final HTTP failures throw an `Error` containing:
 The optional fifth argument is reserved for deterministic tests and should not be mixed into request options:
 
 ```js
-await fetchWrapper('get', url, { retry: 2 }, undefined, {
+await fetchWrapper(fetchWrapper.GET, url, { retry: 2 }, undefined, {
   fetch: mockFetch,
   delay: async () => {},
 });
