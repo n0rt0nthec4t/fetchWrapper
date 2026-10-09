@@ -12,7 +12,7 @@
 // - Preserve HTTP status and response body details on final errors
 // - Allow transport and delay injection for deterministic tests
 //
-// Code version 2026.09.21
+// Code version 2026.10.09
 // Mark Hulskamp
 'use strict';
 
@@ -44,6 +44,7 @@ const RETRYABLE_HTTP_STATUS = [408, 429, 500, 502, 503, 504];
  *
  * Plain object POST data is JSON encoded automatically. Other supported fetch body types are passed through unchanged.
  * Retryable HTTP and transport failures use exponential backoff, while caller cancellation and malformed URLs are terminal.
+ * Streaming request bodies are sent once because they cannot be replayed safely.
  *
  * @param {'get'|'post'} method HTTP method to perform; use `fetchWrapper.GET` or `fetchWrapper.POST`.
  * @param {string} url Request URL.
@@ -110,7 +111,8 @@ async function fetchRequest(method, url, options, data, fetchImplementation, del
   // Apply timeout per attempt while preserving caller-controlled cancellation.
   if (Number.isFinite(Number(options.timeout)) === true && Number(options.timeout) > 0) {
     let timeoutSignal = globalThis.AbortSignal.timeout(Math.floor(Number(options.timeout)));
-    fetchOptions.signal = options.signal === undefined ? timeoutSignal : globalThis.AbortSignal.any([options.signal, timeoutSignal]);
+    fetchOptions.signal =
+      options.signal === undefined || options.signal === null ? timeoutSignal : globalThis.AbortSignal.any([options.signal, timeoutSignal]);
   }
 
   if (method === fetchWrapper.POST && data !== undefined) {
@@ -128,13 +130,18 @@ async function fetchRequest(method, url, options, data, fetchImplementation, del
     }
   }
 
+  // Fetch consumes web streams and async iterables (including Node streams).
+  // Inspect the effective body so options.body and the explicit data argument follow the same retry rule.
+  let replayableBody =
+    typeof fetchOptions.body?.getReader !== 'function' && typeof fetchOptions.body?.[Symbol.asyncIterator] !== 'function';
+
   try {
     let response = await fetchImplementation(url, fetchOptions);
 
     if (response?.ok === false) {
       let retryableStatus = RETRYABLE_HTTP_STATUS.includes(response.status) === true;
 
-      if (retryCount + 1 < retry && retryableStatus === true && options.signal?.aborted !== true) {
+      if (retryCount + 1 < retry && retryableStatus === true && replayableBody === true && options.signal?.aborted !== true) {
         // Release the body before retrying so fetch can reuse the connection.
         try {
           await response.body?.cancel();
@@ -143,7 +150,7 @@ async function fetchRequest(method, url, options, data, fetchImplementation, del
         }
 
         let delay = 500 * Math.pow(2, retryCount);
-        await delayImplementation(delay);
+        await waitForRetry(delay, delayImplementation, options.signal);
 
         return fetchRequest(
           method,
@@ -207,19 +214,25 @@ async function fetchRequest(method, url, options, data, fetchImplementation, del
     }
 
     // Explicit caller cancellation is terminal; transport timeouts remain retryable.
-    if (retryCount + 1 < retry && retryable === true && options.signal?.aborted !== true) {
+    if (retryCount + 1 < retry && retryable === true && replayableBody === true && options.signal?.aborted !== true) {
       let delay = 500 * Math.pow(2, retryCount);
-      await delayImplementation(delay);
+      try {
+        await waitForRetry(delay, delayImplementation, options.signal);
 
-      return fetchRequest(
-        method,
-        url,
-        options,
-        data,
-        fetchImplementation,
-        delayImplementation,
-        retryCount + 1,
-      );
+        return fetchRequest(
+          method,
+          url,
+          options,
+          data,
+          fetchImplementation,
+          delayImplementation,
+          retryCount + 1,
+        );
+      } catch (delayError) {
+        // Report cancellation during backoff through the same structured-error boundary.
+        error = delayError;
+        original = error?.cause ?? error;
+      }
     }
 
     throw Object.assign(
@@ -242,6 +255,45 @@ async function fetchRequest(method, url, options, data, fetchImplementation, del
       },
     );
   }
+}
+
+/**
+ * Wait between attempts while honoring caller cancellation.
+ *
+ * @param {number} delay Retry delay in milliseconds.
+ * @param {function(number): Promise<*>} delayImplementation Selected delay implementation.
+ * @param {AbortSignal|null} [signal] Caller cancellation signal.
+ * @returns {Promise<void>} Resolves when another attempt may begin.
+ * @throws {*} If the delay fails or the caller cancels.
+ * @private
+ */
+async function waitForRetry(delay, delayImplementation, signal) {
+  if (signal === undefined || signal === null) {
+    await delayImplementation(delay);
+    return;
+  }
+
+  signal.throwIfAborted();
+  if (delayImplementation === wait) {
+    // Cancel the native timer too, so it does not keep the process alive after abort.
+    await wait(delay, undefined, { signal });
+  } else {
+    // Injected delays retain their one-argument contract and may not support cancellation.
+    let onAbort;
+    let cancellation = new Promise((resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+
+    try {
+      await Promise.race([delayImplementation(delay), cancellation]);
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  // An injected delay can abort synchronously or while its resolution is queued.
+  signal.throwIfAborted();
 }
 
 // Supported HTTP request methods exposed on the wrapper for callers.

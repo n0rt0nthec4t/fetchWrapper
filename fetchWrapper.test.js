@@ -5,7 +5,10 @@
 'use strict';
 
 import assert from 'node:assert/strict';
+import { getEventListeners } from 'node:events';
+import { Readable } from 'node:stream';
 import test from 'node:test';
+import { setImmediate } from 'node:timers';
 
 import { fetchWrapper } from './fetchWrapper.js';
 
@@ -200,4 +203,159 @@ test('preserves non-retryable HTTP error metadata', async () => {
       return true;
     },
   );
+});
+
+test('accepts a null caller signal with a configured timeout', async () => {
+  let receivedSignal;
+  let response = await fetchWrapper('get', 'data:text/plain,ok', { signal: null, timeout: 1000 }, undefined, {
+    fetch: async (url, options) => {
+      receivedSignal = options.signal;
+      return globalThis.fetch(url, options);
+    },
+  });
+
+  assert.equal(await response.text(), 'ok');
+  assert.equal(receivedSignal instanceof globalThis.AbortSignal, true);
+});
+
+for (let failure of ['http', 'transport']) {
+  for (let pendingDelay of [false, true]) {
+    test('cancels ' + failure + ' retry with an injected ' + (pendingDelay === true ? 'pending' : 'resolved') + ' delay', async () => {
+      let controller = new globalThis.AbortController();
+      let reason = new Error('Caller cancelled during backoff');
+      let attempts = 0;
+      let delays = 0;
+
+      await assert.rejects(
+        fetchWrapper('get', 'https://example.test', { retry: 3, signal: controller.signal }, undefined, {
+          fetch: async () => {
+            attempts += 1;
+            if (failure === 'transport') {
+              throw new TypeError('network unavailable');
+            }
+            return new globalThis.Response('busy', { status: 503 });
+          },
+          delay: async () => {
+            delays += 1;
+            controller.abort(reason);
+            if (pendingDelay === true) {
+              await new Promise(() => {});
+            }
+          },
+        }),
+        (error) => {
+          assert.equal(error.cause, reason);
+          assert.match(error.message, /failed after 1 attempt/);
+          return true;
+        },
+      );
+
+      assert.equal(attempts, 1);
+      assert.equal(delays, 1);
+      assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+    });
+  }
+
+  test('cancels ' + failure + ' retry with the native delay', async () => {
+    let controller = new globalThis.AbortController();
+    let reason = new Error('Caller cancelled during native backoff');
+    let attempts = 0;
+
+    await assert.rejects(
+      fetchWrapper('get', 'https://example.test', { retry: 3, signal: controller.signal }, undefined, {
+        fetch: async () => {
+          attempts += 1;
+          // The immediate runs after the failure has entered the retry timer.
+          setImmediate(() => controller.abort(reason));
+          if (failure === 'transport') {
+            throw new TypeError('network unavailable');
+          }
+          return new globalThis.Response('busy', { status: 503 });
+        },
+      }),
+      (error) => {
+        assert.equal(error.cause, reason);
+        assert.match(error.message, /failed after 1 attempt/);
+        return true;
+      },
+    );
+
+    assert.equal(attempts, 1);
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  });
+
+  for (let streamType of ['web', 'node']) {
+    for (let bodySource of ['data', 'options']) {
+      test('preserves ' + failure + ' failure for a ' + streamType + ' stream passed through ' + bodySource, async () => {
+        let body =
+          streamType === 'node'
+            ? Readable.from(['payload'])
+            : new globalThis.ReadableStream({
+                start(controller) {
+                  controller.enqueue(new globalThis.TextEncoder().encode('payload'));
+                  controller.close();
+                },
+              });
+        let options = { retry: 3, duplex: 'half' };
+        if (bodySource === 'options') {
+          options.body = body;
+        }
+        let attempts = 0;
+        let transportError = new TypeError('connection lost after sending body');
+
+        await assert.rejects(
+          fetchWrapper('post', 'https://example.test', options, bodySource === 'data' ? body : undefined, {
+            fetch: async (url, fetchOptions) => {
+              attempts += 1;
+              // Use native Request consumption to exercise a real one-shot body.
+              assert.equal(await new globalThis.Request(url, fetchOptions).text(), 'payload');
+              if (failure === 'transport') {
+                throw transportError;
+              }
+              return new globalThis.Response('busy', { status: 503 });
+            },
+            delay: async () => assert.fail('A streaming body must not be retried'),
+          }),
+          (error) => {
+            assert.match(error.message, /failed after 1 attempt/);
+            if (failure === 'http') {
+              assert.equal(error.status, 503);
+              assert.equal(error.code, 503);
+              assert.equal(error.body, 'busy');
+            } else {
+              assert.equal(error.cause, transportError);
+            }
+            return true;
+          },
+        );
+
+        assert.equal(attempts, 1);
+      });
+    }
+  }
+}
+
+test('retries a replayable JSON body overriding a streaming options body', async () => {
+  let attempts = 0;
+  let controller = new globalThis.AbortController();
+  let response = await fetchWrapper(
+    'post',
+    'https://example.test',
+    { retry: 2, signal: controller.signal, body: Readable.from(['unused']) },
+    { enabled: true },
+    {
+      fetch: async (url, options) => {
+        attempts += 1;
+        // Keep native Request signal listeners separate from the retry-listener cleanup check.
+        let request = new globalThis.Request(url, { method: options.method, body: options.body, headers: options.headers });
+        assert.equal(await request.text(), '{"enabled":true}');
+        return new globalThis.Response(attempts === 1 ? 'busy' : 'ok', { status: attempts === 1 ? 503 : 200 });
+      },
+      delay: async () => {},
+    },
+  );
+
+  assert.equal(await response.text(), 'ok');
+  assert.equal(attempts, 2);
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
 });

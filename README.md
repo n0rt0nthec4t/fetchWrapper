@@ -77,13 +77,15 @@ Standard fetch options plus these wrapper options:
 | `retry`   | Total number of attempts, including the initial request. Defaults to `1`. |
 | `timeout` | Per-attempt timeout in milliseconds.                                      |
 
-A supplied `signal` is preserved. When both `signal` and `timeout` are present, either can abort the request. Explicit caller cancellation is not retried.
+A supplied `signal` is preserved. When both `signal` and `timeout` are present, either can abort the request. A null signal is treated as absent when applying a timeout. Explicit caller cancellation also interrupts retry backoff and prevents another attempt.
 
 Retries use exponential delays beginning at 500 milliseconds. HTTP retries are limited to status codes `408`, `429`, `500`, `502`, `503`, and `504`. Selected Fetch and Undici transport failures are also retried.
 
 ### `data`
 
 For POST requests, a plain object is serialized as JSON and receives an `application/json` content type unless one is already present. Other supported Fetch body values pass through unchanged.
+
+Streaming bodies, including web streams and Node.js streams, are sent once even when `retry` allows more attempts. They cannot be replayed safely. This also applies to streams supplied through `options.body`; final failures retain their HTTP or transport error details.
 
 ### Return value
 
@@ -123,7 +125,3 @@ node --test src/fetchWrapper/fetchWrapper.test.js
 ```
 
 The implementation and tests use only Node.js built-ins and the standard Fetch API.
-
-## License
-
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

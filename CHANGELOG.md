@@ -4,6 +4,15 @@ All notable changes to `fetchWrapper` are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/).
 
+## 2026/10/09
+
+### Fixed
+
+- Interrupt retry backoff on caller cancellation without starting another request
+- Avoid replaying streaming POST bodies and preserve their original failure details
+- Treat a null caller signal as absent when combining cancellation with a timeout
+- Add regression coverage for HTTP and transport cancellation, streaming body inputs, and null signals
+
 ## 2026/09/21
 
 ### Added
@@ -15,6 +24,7 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Kept retry attempt tracking private to the internal `fetchRequest()` implementation instead of embedding `_retryCount` in caller options
 - Treated `retry` as immutable configuration defining the maximum number of attempts
+- Simplified retryability predicates to return their boolean comparisons directly
 - Added regression coverage confirming retries do not mutate caller options or pass wrapper bookkeeping to Fetch
 
 ## 2026/09/17
