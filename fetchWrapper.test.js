@@ -64,6 +64,35 @@ test('serialises plain POST bodies and applies a default content type', async ()
   assert.equal(receivedOptions.headers.get('Content-Type'), 'application/json');
 });
 
+for (let data of [{ constructor: 'device', enabled: true }, Object.assign(Object.create(null), { enabled: true })]) {
+  test(
+    'serialises a POST object with ' + (Object.getPrototypeOf(data) === null ? 'a null prototype' : 'a constructor property'),
+    async () => {
+      await fetchWrapper('post', 'https://example.test', {}, data, {
+        fetch: async (url, options) => {
+          let request = new globalThis.Request(url, options);
+          assert.equal(await request.text(), JSON.stringify(data));
+          assert.equal(request.headers.get('Content-Type'), 'application/json');
+          return new globalThis.Response('ok');
+        },
+      });
+    },
+  );
+}
+
+test('preserves native POST body types when detecting plain objects', async () => {
+  let data = new globalThis.URLSearchParams({ enabled: 'true' });
+  await fetchWrapper('post', 'https://example.test', {}, data, {
+    fetch: async (url, options) => {
+      assert.equal(options.body, data);
+      let request = new globalThis.Request(url, options);
+      assert.equal(await request.text(), 'enabled=true');
+      assert.equal(request.headers.get('Content-Type'), 'application/x-www-form-urlencoded;charset=UTF-8');
+      return new globalThis.Response('ok');
+    },
+  });
+});
+
 test('preserves an existing content type regardless of header casing', async () => {
   let receivedOptions;
 
@@ -284,18 +313,26 @@ for (let failure of ['http', 'transport']) {
     assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
   });
 
-  for (let streamType of ['web', 'node']) {
+  for (let streamType of ['web', 'node', 'async iterable']) {
     for (let bodySource of ['data', 'options']) {
       test('preserves ' + failure + ' failure for a ' + streamType + ' stream passed through ' + bodySource, async () => {
-        let body =
-          streamType === 'node'
-            ? Readable.from(['payload'])
-            : new globalThis.ReadableStream({
-                start(controller) {
-                  controller.enqueue(new globalThis.TextEncoder().encode('payload'));
-                  controller.close();
-                },
-              });
+        let body;
+        if (streamType === 'node') {
+          body = Readable.from(['payload']);
+        } else if (streamType === 'async iterable') {
+          body = {
+            async *[Symbol.asyncIterator]() {
+              yield 'payload';
+            },
+          };
+        } else {
+          body = new globalThis.ReadableStream({
+            start(controller) {
+              controller.enqueue(new globalThis.TextEncoder().encode('payload'));
+              controller.close();
+            },
+          });
+        }
         let options = { retry: 3, duplex: 'half' };
         if (bodySource === 'options') {
           options.body = body;
@@ -307,6 +344,8 @@ for (let failure of ['http', 'transport']) {
           fetchWrapper('post', 'https://example.test', options, bodySource === 'data' ? body : undefined, {
             fetch: async (url, fetchOptions) => {
               attempts += 1;
+              assert.equal(fetchOptions.body, body);
+              assert.equal(new globalThis.Headers(fetchOptions.headers).has('Content-Type'), false);
               // Use native Request consumption to exercise a real one-shot body.
               assert.equal(await new globalThis.Request(url, fetchOptions).text(), 'payload');
               if (failure === 'transport') {

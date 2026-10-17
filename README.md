@@ -1,6 +1,6 @@
 # fetchWrapper
 
-`fetchWrapper` is a dependency-free HTTP request helper shared by the Accfactory projects. It wraps the Node.js Fetch API with consistent timeout, cancellation, retry, JSON-body, response-cleanup, and structured-error behaviour.
+`fetchWrapper` is a dependency-free Node.js module for GET and POST requests. It wraps the native Fetch API with per-attempt timeouts, caller cancellation, retries, automatic JSON request bodies, and structured errors. Successful requests return the native `Response` so callers control how the response body is read.
 
 The repository is intended to be consumed as a Git submodule. It is not published as an npm package.
 
@@ -9,47 +9,30 @@ The repository is intended to be consumed as a Git submodule. It is not publishe
 - Node.js 22, 24, or 26
 - An environment providing the standard Fetch API
 
-## Adding the submodule
+## Usage
 
-Add the repository beneath `src` in an Accfactory project:
-
-```sh
-git submodule add https://github.com/n0rt0nthec4t/fetchWrapper.git src/fetchWrapper
-git commit -m "Add fetchWrapper submodule"
-```
-
-Initialize it after cloning an existing project:
-
-```sh
-git submodule update --init --recursive
-```
-
-To update a project to the latest fetchWrapper commit:
-
-```sh
-git submodule update --remote src/fetchWrapper
-git add src/fetchWrapper
-git commit -m "Update fetchWrapper"
-```
-
-## Building an Accfactory project
-
-The existing Accfactory build layout can flatten the shared file into `dist`:
-
-```text
-copyfiles -u 2 src/fetchWrapper/fetchWrapper.js dist
-```
-
-Application source can then use the same imports as the generated `dist` layout:
+Import the named export from `fetchWrapper.js`, adjusting the path to its location in your project:
 
 ```js
 import { fetchWrapper } from './fetchWrapper.js';
+
+const response = await fetchWrapper(fetchWrapper.GET, 'https://example.com/api/items', {
+  timeout: 5000,
+  retry: 3,
+});
+
+const items = await response.json();
 ```
 
-Code in a `plugins` directory uses:
+Pass a plain object as the fourth argument to send JSON in a POST request:
 
 ```js
-import { fetchWrapper } from '../fetchWrapper.js';
+const response = await fetchWrapper(
+  fetchWrapper.POST,
+  'https://example.com/api/items',
+  { timeout: 5000 },
+  { name: 'Example', enabled: true },
+);
 ```
 
 ## API
@@ -83,17 +66,19 @@ Retries use exponential delays beginning at 500 milliseconds. HTTP retries are l
 
 ### `data`
 
-For POST requests, a plain object is serialized as JSON and receives an `application/json` content type unless one is already present. Other supported Fetch body values pass through unchanged.
+For POST requests, a plain object is serialised as JSON and receives an `application/json` content type unless one is already present. Other supported Fetch body values pass through unchanged.
 
 Streaming bodies, including web streams and Node.js streams, are sent once even when `retry` allows more attempts. They cannot be replayed safely. This also applies to streams supplied through `options.body`; final failures retain their HTTP or transport error details.
 
+For streaming request bodies, pass `duplex: 'half'` in `options` as required by Node.js Fetch. The wrapper does not add this option automatically.
+
 ### Return value
 
-Successful requests return the native `Response`. Invalid helper inputs return `undefined` for compatibility with existing Accfactory callers.
+Successful requests return the native `Response`. Unsupported methods, empty or non-string URLs, and options that fail the wrapper's plain-object validation return `undefined`. Omitted options default to `{}`. Malformed non-empty URL strings throw an error.
 
 ### Errors
 
-Final HTTP failures throw an `Error` containing:
+Final HTTP and transport failures throw an `Error` containing:
 
 | Property | Description                                         |
 | -------- | --------------------------------------------------- |
@@ -117,11 +102,12 @@ Production callers should omit this argument.
 
 ## Development
 
-This repository deliberately has no `package.json`. The consuming project owns the Node.js module type, formatting, linting, and test tooling. After adding the submodule, run verification from the consuming project's root:
+Run the test suite from this repository's root:
 
 ```sh
-npm run lint
-node --test src/fetchWrapper/fetchWrapper.test.js
+node --test fetchWrapper.test.js
 ```
 
-The implementation and tests use only Node.js built-ins and the standard Fetch API.
+The implementation and tests use ES modules, Node.js built-ins, and the standard Fetch API. No dependency installation or build step is required to run the tests on the supported Node.js versions.
+
+This repository has no `package.json` or npm scripts. Formatting and linting tools must be supplied separately; the repository includes Prettier and ESLint configuration files.

@@ -12,7 +12,7 @@
 // - Preserve HTTP status and response body details on final errors
 // - Allow transport and delay injection for deterministic tests
 //
-// Code version 2026.10.09
+// Code version 2026.10.17
 // Mark Hulskamp
 'use strict';
 
@@ -116,12 +116,19 @@ async function fetchRequest(method, url, options, data, fetchImplementation, del
   }
 
   if (method === fetchWrapper.POST && data !== undefined) {
-    // Encode only plain objects; native fetch body types pass through unchanged.
-    if (typeof data === 'object' && data !== null && data.constructor === Object) {
+    // Use the prototype because JSON data can shadow constructor or have no prototype.
+    // Plain objects can also implement streaming bodies, which must bypass JSON encoding.
+    if (
+      typeof data === 'object' &&
+      data !== null &&
+      (Object.getPrototypeOf(data) === Object.prototype || Object.getPrototypeOf(data) === null) &&
+      typeof data.getReader !== 'function' &&
+      typeof data[Symbol.asyncIterator] !== 'function'
+    ) {
       fetchOptions.body = JSON.stringify(data);
       fetchOptions.headers = new globalThis.Headers(fetchOptions.headers);
 
-      // Headers normalizes every valid HeadersInit form and casing.
+      // Headers normalises every valid HeadersInit form and casing.
       if (fetchOptions.headers.has('Content-Type') === false) {
         fetchOptions.headers.set('Content-Type', 'application/json');
       }
@@ -152,15 +159,7 @@ async function fetchRequest(method, url, options, data, fetchImplementation, del
         let delay = 500 * Math.pow(2, retryCount);
         await waitForRetry(delay, delayImplementation, options.signal);
 
-        return fetchRequest(
-          method,
-          url,
-          options,
-          data,
-          fetchImplementation,
-          delayImplementation,
-          retryCount + 1,
-        );
+        return fetchRequest(method, url, options, data, fetchImplementation, delayImplementation, retryCount + 1);
       }
 
       // Preserve available response details on the final HTTP failure.
@@ -219,15 +218,7 @@ async function fetchRequest(method, url, options, data, fetchImplementation, del
       try {
         await waitForRetry(delay, delayImplementation, options.signal);
 
-        return fetchRequest(
-          method,
-          url,
-          options,
-          data,
-          fetchImplementation,
-          delayImplementation,
-          retryCount + 1,
-        );
+        return fetchRequest(method, url, options, data, fetchImplementation, delayImplementation, retryCount + 1);
       } catch (delayError) {
         // Report cancellation during backoff through the same structured-error boundary.
         error = delayError;
